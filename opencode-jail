@@ -1,0 +1,164 @@
+#!/bin/bash
+set -eo pipefail
+
+IMAGE_NAME="opencode-standalone"
+SCRIPT_PATH="$(readlink -f "$0")"
+FORCE_REBUILD=false
+SHELL_MODE=false
+PASSTHROUGH_ARGS=()
+: "${USER:=$(id -un)}"
+: "${GITHUB_TOKEN:=}"
+
+# ============================================
+# Custom apt packages to install (space-separated)
+# Modify this line to add your own packages
+CUSTOM_APT_PACKAGES="jq dnsutils openssh-client"
+# ============================================
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --rebuild|-r)
+            FORCE_REBUILD=true
+            shift
+            ;;
+        --shell|-s)
+            SHELL_MODE=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS] [-- ARGS...]"
+            echo ""
+            echo "Options:"
+            echo "  -r,  --rebuild       Force rebuild of the Docker image"
+            echo "  -s,  --shell         Start a bash shell instead of opencode"
+            echo "  -h,  --help          Show this help message"
+            echo ""
+            echo "Arguments after -- are passed through to opencode."
+            exit 0
+            ;;
+        --)
+            shift
+            PASSTHROUGH_ARGS+=("$@")
+            break
+            ;;
+        *)
+            echo "Warning: Unknown option '$1'" >&2
+            shift
+            ;;
+    esac
+done
+
+opencode_data="$HOME/.opencode-home"
+mkdir -p "$opencode_data/.opencode"
+mkdir -p "$opencode_data/.local/state"
+mkdir -p "$opencode_data/.config/opencode"
+mkdir -p "$HOME/.local/share/opencode"
+
+# Compute hash of this script to detect changes
+SCRIPT_HASH=$(md5sum "$SCRIPT_PATH" | cut -d' ' -f1)
+
+# Check if rebuild is needed
+NEEDS_BUILD=false
+if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    echo "Image '$IMAGE_NAME' not found. Building..."
+    NEEDS_BUILD=true
+elif [ "$FORCE_REBUILD" = true ]; then
+    echo "Forcing rebuild of '$IMAGE_NAME'..."
+    NEEDS_BUILD=true
+else
+    # Check if script has changed since last build
+    STORED_HASH=$(docker image inspect "$IMAGE_NAME" --format '{{index .Config.Labels "script.hash"}}' 2>/dev/null)
+    if [ "$SCRIPT_HASH" != "$STORED_HASH" ]; then
+        echo "Script changed since last build. Rebuilding '$IMAGE_NAME'..."
+        NEEDS_BUILD=true
+    fi
+fi
+
+if [ "$NEEDS_BUILD" = true ]; then
+    DOCKER_GID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null) || true
+    if [ -z "$DOCKER_GID" ]; then
+        echo "Failed to determine docker group ID from /var/run/docker.sock"
+        exit 1
+    fi
+    docker build \
+      --build-arg DOCKER_GID="$DOCKER_GID" \
+      --build-arg CUSTOM_APT_PACKAGES="$CUSTOM_APT_PACKAGES" \
+      --label "script.hash=$SCRIPT_HASH" \
+      -t "$IMAGE_NAME" - <<'DOCKERFILE'
+FROM node:22-bookworm
+
+ARG DOCKER_GID
+ARG CUSTOM_APT_PACKAGES
+
+# Install system dependencies, Docker CLI, and custom packages
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+    && if [ -n "$CUSTOM_APT_PACKAGES" ]; then \
+        apt-get install -y --no-install-recommends $CUSTOM_APT_PACKAGES; \
+    fi \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install OpenCode globally (available to all users)
+RUN npm install -g opencode-ai
+
+# Add user to docker group for docker access (handle GID collision in base image)
+RUN if getent group ${DOCKER_GID} >/dev/null 2>&1; then \
+        EXISTING_GROUP=$(getent group ${DOCKER_GID} | cut -d: -f1); \
+        usermod -aG "$EXISTING_GROUP" node; \
+    else \
+        groupadd -g ${DOCKER_GID} docker && usermod -aG docker node; \
+    fi
+
+# Switch to non-root user
+USER node
+
+WORKDIR /workspace
+CMD ["opencode"]
+DOCKERFILE
+fi
+
+# Build the docker run command
+# Mount the actual host path to the same path inside the container
+# This is required for docker-compose to work correctly with volume mounts
+HOST_PWD="$(pwd)"
+DOCKER_ARGS=(
+  -it --rm
+  --label "hostdir=$HOST_PWD"
+  -v "$HOST_PWD:$HOST_PWD"
+  -v "$opencode_data/.opencode:/home/node/.opencode"
+  -v "$HOME/.local/share/opencode:/home/node/.local/share/opencode"
+  -v "$opencode_data/.local/state:/home/node/.local/state"
+  -v "$opencode_data/.config/opencode:/home/node/.config/opencode"
+  -v "/var/run/docker.sock:/var/run/docker.sock"
+  -w "$HOST_PWD"
+  -e GITHUB_TOKEN
+)
+
+if [ "$SHELL_MODE" = true ]; then
+    EXISTING=$(docker ps -q --filter "label=hostdir=$HOST_PWD" --filter "ancestor=$IMAGE_NAME" | head -1)
+    if [ -n "$EXISTING" ]; then
+        exec docker exec -it "$EXISTING" bash
+    else
+        exec docker run "${DOCKER_ARGS[@]}" -u root "$IMAGE_NAME" bash
+    fi
+elif [ ${#PASSTHROUGH_ARGS[@]} -gt 0 ]; then
+    exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" opencode "${PASSTHROUGH_ARGS[@]}"
+else
+    exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME"
+fi
