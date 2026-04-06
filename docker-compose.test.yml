@@ -1,29 +1,53 @@
 services:
+  # Simple web service that responds on port 8080
+  test-web:
+    image: alpine:3.19
+    container_name: jail-test-web
+    command:
+      - sh
+      - -c
+      - |
+        echo 'Web server running' &&
+        while true; do
+          echo -e 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK' | nc -l -p 8080
+        done
+    ports:
+      - "8080:8080"
+
+  # Test runner: checks volume mounts and compose service networking
   docker-access-test:
     image: alpine:3.19
-    container_name: docker-access-test
-    command: >
-      sh -c "
-        echo '=== Docker socket access test ===' &&
-        if [ -S /var/run/docker.sock ]; then
-          echo '[PASS] /var/run/docker.sock is present' ;
-        else
-          echo '[FAIL] /var/run/docker.sock not found' && exit 1 ;
-        fi &&
-        if docker info > /dev/null 2>&1; then
-          echo '[PASS] docker info succeeded' ;
-        else
-          echo '[FAIL] docker info failed' && exit 1 ;
-        fi &&
-        echo '[PASS] Docker container access verified' &&
-        docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' &&
-        echo '=== Done ==='
-      "
+    container_name: jail-docker-access-test
+    depends_on:
+      - test-web
+    working_dir: /workspace
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    # Install docker CLI at runtime (Alpine package)
-    entrypoint: >
-      sh -c "
-        apk add --quiet docker-cli 2>/dev/null &&
-        exec sh -c \"$$@\"
-      " --
+      - .:/workspace
+    command:
+      - sh
+      - -c
+      - |
+        echo '=== DinD Docker Compose Test ==='
+        echo ''
+
+        echo '--- Test 1: Volume mount (project files visible) ---'
+        if [ -f /workspace/docker-compose.test.yml ]; then
+          echo '[PASS] docker-compose.test.yml found via volume mount'
+        else
+          echo '[FAIL] docker-compose.test.yml not found' && exit 1
+        fi
+        echo ''
+
+        echo '--- Test 2: Compose service networking ---'
+        ATTEMPT=1
+        while [ "$$ATTEMPT" -le 10 ]; do
+          BODY=$$(wget -qO- http://test-web:8080 2>/dev/null) && {
+            echo "[PASS] Got response from test-web: $$BODY"
+            exit 0
+          }
+          echo "  retry $$ATTEMPT..."
+          ATTEMPT=$$((ATTEMPT + 1))
+          sleep 1
+        done
+        echo '[FAIL] Could not reach test-web'
+        exit 1
