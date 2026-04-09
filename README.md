@@ -1,30 +1,38 @@
 # opencode-jail
 
-A single-file Bash launcher that runs [OpenCode](https://opencode.ai) inside a Docker sandbox, keeping Node and all dependencies off your host machine. The `opencode` process is restricted to the directory from which `opencode-jail` is launched, but retains full access to Docker Compose services defined in that same directory.
+A single-file Bash launcher that runs [OpenCode](https://opencode.ai) inside a Docker sandbox, keeping Node and all dependencies off your host machine. The `opencode` process is restricted to the directory from which `opencode-jail` is launched, but retains scoped access to the Docker Compose project rooted in that same directory.
 
 ## How it works
 
 On first run, `opencode-jail` builds a Docker image from an embedded Dockerfile (Node 22 on Debian Bookworm with OpenCode and common CLI tools pre-installed). Subsequent runs reuse the cached image. If you edit the script — for example to add packages — the image is automatically rebuilt via `md5sum` change detection.
 
-### Docker-in-Docker (DinD) isolation
+### Compose-scoped Docker access via a filtering shim
 
-Rather than mounting the host Docker socket, `opencode-jail` spins up a dedicated Docker-in-Docker sidecar container for each session. The OpenCode container connects to this isolated daemon over TCP via `DOCKER_HOST`. This means:
+The host Docker socket is bind-mounted into the jail, but the real `docker` CLI is moved aside and a shim is installed at `/usr/local/bin/docker`. The shim filters every invocation against the label
 
-- The OpenCode process **cannot see or interact with host containers**
-- The host Docker socket is **never mounted** into the jail
-- Docker Compose services launched from within the jail run inside the isolated daemon
+```
+com.docker.compose.project.working_dir = $(pwd)
+```
 
-The DinD sidecar and its private network are **scoped per launch directory** using a 12-character hash of the working directory path. Two concurrent sessions in different directories each get their own fully independent sidecar and network — they cannot interfere with each other.
+so `opencode` can only see, exec into, log, stop, restart, etc. containers belonging to the compose project rooted at the launch directory. Host-wide operations (`run`, `create`, `build`, `image`, `network`, `volume`, `system`, `swarm`, …) are refused outright. `docker compose` is permitted but scope-escape flags (`-f`, `-p`, `--project-directory`, `--env-file`) are blocked.
 
-When the OpenCode session ends the sidecar container and private network are automatically torn down.
+> The shim is a **soft fence**, not a sandbox primitive. Anything that can talk to `/var/run/docker.sock` directly (raw `curl`, a statically-linked docker binary, etc.) bypasses it. Treat it as a guard rail for an obedient agent, not a security boundary against an adversary.
+
+### Compose network auto-attach
+
+If a compose project is already running with its `working_dir` equal to `$(pwd)`, `opencode-jail` enumerates the networks those containers are on and attaches the jail container to each one, so opencode can reach services by their compose service name (e.g. `http://test-web:8080`). Extra networks can be attached with `-n/--network NAME` (repeatable).
+
+If no compose project is running, the jail starts on the default bridge only and prints a warning; bring your stack up with `docker compose up -d` first.
+
+### Container hardening
+
+The jail container runs with `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and as the host user's UID/GID. The docker socket gid is added via `--group-add` so the unprivileged user can still use the socket through the shim.
 
 ## Prerequisites
 
 - Docker installed and running
 
 ## Installation
-
-Copy the script to somewhere on your `$PATH` and make it executable:
 
 ```bash
 cp opencode-jail ~/.local/bin/opencode-jail
@@ -38,6 +46,7 @@ opencode-jail [OPTIONS] [-- ARGS...]
 
 Options:
   -e, --env KEY=VAL    Pass an environment variable to the container (repeatable)
+  -n, --network NAME   Attach the jail container to an extra docker network (repeatable)
   -r, --rebuild        Force rebuild of the Docker image
       --no-cache       Rebuild the Docker image without using cache
   -s, --shell          Start a bash shell instead of opencode
@@ -55,14 +64,14 @@ opencode-jail
 # Open a shell inside the jail container
 opencode-jail --shell
 
-# Attach to an already-running container from the same directory
-opencode-jail --shell
-
 # Force a full image rebuild
 opencode-jail --rebuild
 
 # Rebuild without Docker layer cache
 opencode-jail --rebuild --no-cache
+
+# Attach the jail to an additional docker network
+opencode-jail -n my-other-network
 
 # Pass extra environment variables into the container
 opencode-jail -e MY_API_KEY=abc123 -e DEBUG=1
@@ -71,7 +80,7 @@ opencode-jail -e MY_API_KEY=abc123 -e DEBUG=1
 opencode-jail -- --help
 ```
 
-If `--shell` is used while a container from the same working directory is already running, the script `docker exec`s into it rather than starting a new one. In that case the DinD sidecar is left running — it is only torn down when the primary session exits.
+If `--shell` is used while a jail container from the same working directory is already running, the script `docker exec`s into it instead of starting a new one.
 
 ## Configuration
 
@@ -81,7 +90,7 @@ If `--shell` is used while a container from the same working directory is alread
 |---|---|
 | `GITHUB_TOKEN` | GitHub CLI authentication (`gh`) |
 
-The token is passed through to the container automatically from your environment. Additional variables can be forwarded with `-e KEY=VALUE`.
+Additional variables can be forwarded with `-e KEY=VALUE`.
 
 ### Adding packages
 
@@ -98,40 +107,41 @@ Save the file and the image will rebuild automatically on the next run.
 | Host path | Container path | Purpose |
 |---|---|---|
 | `$(pwd)` | same path | Current working directory (read-write) |
-| `~/.opencode-home/.opencode` | `$HOME/.opencode` | OpenCode state |
-| `~/.opencode-home/.local/state` | `$HOME/.local/state` | OpenCode local state |
-| `~/.local/share/opencode` | `$HOME/.local/share/opencode` | OpenCode data and auth (shared credentials) |
-| `~/.opencode-home/.config/opencode` | `$HOME/.config/opencode` | OpenCode config |
+| `/var/run/docker.sock` | `/var/run/docker.sock` | Host docker socket (filtered by shim) |
+| `~/.opencode-home/.opencode` | `/home/node/.opencode` | OpenCode state |
+| `~/.opencode-home/.local/state` | `/home/node/.local/state` | OpenCode local state |
+| `~/.local/share/opencode` | `/home/node/.local/share/opencode` | OpenCode data and auth (shared credentials) |
+| `~/.opencode-home/.config/opencode` | `/home/node/.config/opencode` | OpenCode config |
+| `~/.opencode-home/.cache` | `/home/node/.cache` | OpenCode cache |
 
-The host Docker socket is **not** mounted. Docker access is provided exclusively through the DinD sidecar via `DOCKER_HOST`.
-
-The current directory is mounted at its exact host path inside both the jail container and the DinD sidecar. This ensures that Docker Compose volume mounts (which are resolved by the Docker daemon) refer to paths that actually exist inside the sidecar.
+The current directory is mounted at its exact host path so that compose volume mounts with relative paths resolve identically inside and outside the jail.
 
 ### Shared credentials
 
-`~/.local/share/opencode` is mounted directly from the real host home directory so that API keys and auth tokens stored by OpenCode on the host are automatically available inside the jail without re-authenticating.
+`~/.local/share/opencode` is mounted directly from the real host home so that API keys and auth tokens stored by OpenCode on the host are automatically available inside the jail without re-authenticating.
 
 ## Docker Compose support
 
-Docker Compose files in the launched directory work as expected inside the jail:
+Any compose project rooted at the launch directory works transparently:
 
-- The DinD daemon can pull images from Docker Hub and other registries
-- Compose services can reference each other by service name (DNS resolution within the Compose network)
-- Volume mounts using relative paths (e.g. `./src:/app/src`) resolve correctly because the working directory is mounted into the DinD sidecar at the same absolute path
+- `docker ps` inside the jail is auto-filtered to project containers
+- `docker exec <svc>`, `docker logs <svc>`, `docker compose ps|logs|restart`, etc. all operate against the running stack on the host
+- Services are reachable by compose service name because the jail is attached to their networks
 
 ## Architecture
 
 ```
 Host
 └── opencode-jail (bash script)
-    ├── builds/reuses Docker image: opencode-standalone
-    ├── starts DinD sidecar:  opencode-jail-dind-<dirhash>
-    │     └── privileged container running dockerd on TCP (no TLS)
-    ├── creates private network: opencode-jail-net-<dirhash>
-    │     └── only the sidecar and jail container are attached
-    └── runs jail container: opencode-standalone
-          ├── DOCKER_HOST → tcp://<dind-ip>:2375
-          ├── workspace mounted read-write
+    ├── builds/reuses Docker image: opencode-jail
+    ├── detects compose project containers + networks for $(pwd)
+    └── runs jail container
+          ├── /var/run/docker.sock bind-mounted
+          ├── /usr/local/bin/docker → filtering shim
+          ├── /usr/local/libexec/docker-real → real docker CLI (hidden)
+          ├── attached to each detected compose network
+          ├── workspace mounted read-write at its host path
+          ├── runs as host UID:GID, cap-drop=ALL, no-new-privileges
           └── opencode config dirs mounted from ~/.opencode-home/
 ```
 
@@ -140,32 +150,27 @@ Host
 The Docker image ships with these CLI tools alongside OpenCode:
 
 - `gh` — GitHub CLI
-- `docker` CLI and `docker compose` plugin
+- `docker` CLI (via shim) and `docker compose` plugin
 - `openssh-client`, `dnsutils`, `jq`, `curl`
 
 ## Testing
 
-`docker-compose.test.yml` verifies that the DinD setup works correctly — that project files are visible via volume mounts and that Compose service networking functions inside the jail.
-
-Run the test from within an `opencode-jail --shell` session:
+`compose.yml` at the repo root defines a tiny `test-web` service that listens on port 8080 and returns `OK`. To verify the shim and network auto-attach:
 
 ```bash
-docker compose -f docker-compose.test.yml up --abort-on-container-exit --exit-code-from docker-access-test
+# On the host
+docker compose up -d
+
+# Then, in the same directory
+opencode-jail --shell
+
+# Inside the jail
+docker ps                           # should list jail-test-web only
+curl http://test-web:8080           # should print OK
+docker run --rm alpine echo nope    # should be refused by the shim
 ```
 
-Expected output:
-
-```
-=== DinD Docker Compose Test ===
-
---- Test 1: Volume mount (project files visible) ---
-[PASS] docker-compose.test.yml found via volume mount
-
---- Test 2: Compose service networking ---
-[PASS] Got response from test-web: OK
-
-=== ALL TESTS PASSED ===
-```
+Tear it down on the host with `docker compose down`.
 
 ## License
 
