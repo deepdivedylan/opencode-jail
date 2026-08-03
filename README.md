@@ -89,6 +89,7 @@ If `--shell` is used while a jail container from the same working directory is a
 | Variable | Purpose |
 |---|---|
 | `GITHUB_TOKEN` | GitHub CLI authentication (`gh`) |
+| `EDITOR` | Default editor (`vim`) |
 
 Additional variables can be forwarded with `-e KEY=VALUE`.
 
@@ -97,7 +98,7 @@ Additional variables can be forwarded with `-e KEY=VALUE`.
 To install extra packages into the image, edit the `CUSTOM_APT_PACKAGES` variable near the top of the script:
 
 ```bash
-CUSTOM_APT_PACKAGES="jq dnsutils openssh-client git tmux"
+CUSTOM_APT_PACKAGES="jq dnsutils openssh-client vim git tmux"
 ```
 
 Save the file and the image will rebuild automatically on the next run.
@@ -113,6 +114,8 @@ Save the file and the image will rebuild automatically on the next run.
 | `~/.local/share/opencode` | `/home/node/.local/share/opencode` | OpenCode data and auth (shared credentials) |
 | `~/.opencode-home/.config/opencode` | `/home/node/.config/opencode` | OpenCode config |
 | `~/.opencode-home/.cache` | `/home/node/.cache` | OpenCode cache |
+| `~/.vimrc` | `/home/node/.vimrc` (read-only) | Vim configuration |
+| `~/.vim/` | `/home/node/.vim/` (read-only) | Vim plugins and runtime files |
 
 The current directory is mounted at its exact host path so that compose volume mounts with relative paths resolve identically inside and outside the jail.
 
@@ -151,6 +154,7 @@ The Docker image ships with these CLI tools alongside OpenCode:
 
 - `gh` — GitHub CLI
 - `docker` CLI (via shim) and `docker compose` plugin
+- `vim`
 - `openssh-client`, `dnsutils`, `jq`, `curl`
 
 ## Testing

@@ -16,7 +16,7 @@ EXTRA_NETWORKS=()
 # ============================================
 # Custom apt packages to install (space-separated)
 # Modify this line to add your own packages
-CUSTOM_APT_PACKAGES="jq dnsutils openssh-client"
+CUSTOM_APT_PACKAGES="jq dnsutils openssh-client vim"
 # ============================================
 
 # Parse command line arguments
@@ -101,6 +101,8 @@ mkdir -p "$opencode_data/.local/state"
 mkdir -p "$opencode_data/.config/opencode"
 mkdir -p "$opencode_data/.cache"
 mkdir -p "$HOME/.local/share/opencode"
+mkdir -p "$HOME/.vim"
+touch -a "$HOME/.vimrc"
 
 # Compute hash of this script to detect changes
 SCRIPT_HASH=$(md5sum "$SCRIPT_PATH" | cut -d' ' -f1)
@@ -451,8 +453,11 @@ DOCKER_ARGS=(
   -v "$opencode_data/.local/state:/home/node/.local/state"
   -v "$opencode_data/.config/opencode:/home/node/.config/opencode"
   -v "$opencode_data/.cache:/home/node/.cache"
+  -v "$HOME/.vimrc:/home/node/.vimrc:ro"
+  -v "$HOME/.vim:/home/node/.vim:ro"
   -w "$HOST_PWD"
   -e HOME=/home/node
+  -e EDITOR=vim
   -e "OPENCODE_JAIL_COMPOSE_WORKDIR=$HOST_PWD"
   -e GITHUB_TOKEN
 )
