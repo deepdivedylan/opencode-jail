@@ -2,6 +2,7 @@
 set -eo pipefail
 
 IMAGE_NAME="opencode-jail"
+VIM_PLUGIN="@leohenon/opencode-vim-plugin"
 HOST_PWD="$(pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
 FORCE_REBUILD=false
@@ -13,13 +14,10 @@ EXTRA_NETWORKS=()
 : "${USER:=$(id -un)}"
 : "${GITHUB_TOKEN:=}"
 
-# ============================================
-# Custom apt packages to install (space-separated)
-# Modify this line to add your own packages
+# Extra apt packages (space-separated).
 CUSTOM_APT_PACKAGES="jq dnsutils openssh-client vim"
-# ============================================
 
-# Parse command line arguments
+# Parse arguments.
 while [[ $# -gt 0 ]]; do
     case $1 in
         --rebuild|-r)
@@ -94,7 +92,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Create opencode data directories
+# Create persistent directories.
 opencode_data="$HOME/.opencode-home"
 mkdir -p "$opencode_data/.opencode"
 mkdir -p "$opencode_data/.local/state"
@@ -104,10 +102,9 @@ mkdir -p "$HOME/.local/share/opencode"
 mkdir -p "$HOME/.vim"
 touch -a "$HOME/.vimrc"
 
-# Compute hash of this script to detect changes
 SCRIPT_HASH=$(md5sum "$SCRIPT_PATH" | cut -d' ' -f1)
 
-# Check if rebuild is needed
+# Rebuild when missing, requested, or changed.
 NEEDS_BUILD=false
 if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
     echo "Image '$IMAGE_NAME' not found. Building..."
@@ -130,11 +127,8 @@ FROM node:22-bookworm
 
 ARG CUSTOM_APT_PACKAGES
 
-# Install base utilities and the docker CLI + compose plugin from Docker's
-# official repo.  We do NOT install docker-ce or containerd - the daemon lives
-# on the host and is reached via the bind-mounted socket.  The real CLI is
-# moved out of $PATH; the shim at /usr/local/bin/docker takes over and
-# filters every command by compose project label.
+# Install utilities and Docker CLI only; the daemon runs on the host.
+# A shim filters CLI access by Compose project.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg build-essential \
@@ -152,7 +146,6 @@ RUN apt-get update \
     fi \
     && rm -rf /var/lib/apt/lists/*
 
-# Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
@@ -160,40 +153,29 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Move the real docker binary out of $PATH and install the filtering shim.
+# Replace Docker CLI with the filtering shim.
 RUN install -d /usr/local/libexec \
     && mv /usr/bin/docker /usr/local/libexec/docker-real
 
 COPY docker-shim /usr/local/bin/docker
 RUN chmod 0755 /usr/local/bin/docker
 
-# Install OpenCode globally (available to all users)
 RUN npm install -g opencode-ai
 
 WORKDIR /workspace
 CMD ["opencode"]
 DOCKERFILE
 
-    # Write the docker shim that will be COPY'd into /usr/local/bin/docker.
+    # Build the Docker filtering shim.
     cat > "$BUILD_DIR/docker-shim" <<'SHIM'
 #!/bin/bash
-# opencode-jail docker shim
+# Restrict Docker CLI access to containers from the current Compose project.
+# Scope is resolved live using:
+#   com.docker.compose.project.working_dir=$OPENCODE_JAIL_COMPOSE_WORKDIR
+# Host-wide operations are blocked.
 #
-# Filters access to the host docker daemon so that, from inside the jail, only
-# containers belonging to the compose project rooted at this directory can be
-# inspected, exec'd into, started, stopped, etc.  Host-wide operations
-# (run/create/build/network/volume/system/...) are blocked outright.
-#
-# Scope is computed live from the docker daemon by querying for containers
-# labeled
-#     com.docker.compose.project.working_dir = $OPENCODE_JAIL_COMPOSE_WORKDIR
-# (defaulting to the current working directory).  Containers brought up *after*
-# the jail starts are picked up automatically.
-#
-# IMPORTANT: this shim is a soft fence, not a sandbox primitive.  Anything that
-# can talk to /var/run/docker.sock directly (curl, a statically linked docker
-# binary, an MCP server, etc.) bypasses it.  Treat it as a guard rail for an
-# obedient agent, not a security boundary against an adversary.
+# This is a soft fence: direct socket clients bypass it. It is not a security
+# boundary against adversarial code.
 
 set -uo pipefail
 
@@ -347,20 +329,58 @@ SHIM
     rm -rf "$BUILD_DIR"
 fi
 
-# ---------------------------------------------------------------------------
-# Compose project detection.
-#
-# opencode-jail mounts the host docker socket into the jail container so that
-# opencode can `docker exec`, `docker logs`, `docker compose ps` etc. against
-# the user's already-running compose stack.  To keep the blast radius narrow,
-# the docker CLI inside the image is replaced by a shim (see docker-shim
-# above) that filters every command by the compose project label
-#     com.docker.compose.project.working_dir = $(pwd)
-#
-# Here, on the host, we also enumerate the docker networks those compose
-# containers are on and attach the jail container to the same networks (so
-# DNS service-name resolution works).
-# ---------------------------------------------------------------------------
+# Hide the sidebar initially without overriding later changes.
+sidebar_marker="$opencode_data/.local/state/opencode/.opencode-jail-sidebar-default"
+if [ ! -e "$sidebar_marker" ]; then
+    mkdir -p "$(dirname "$sidebar_marker")"
+    if docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        --cap-drop=ALL \
+        --security-opt=no-new-privileges \
+        -v "$opencode_data/.local/state:/home/node/.local/state" \
+        "$IMAGE_NAME" node -e '
+const fs = require("fs");
+const path = "/home/node/.local/state/opencode/kv.json";
+let state = {};
+try {
+  state = JSON.parse(fs.readFileSync(path, "utf8"));
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+state.sidebar = "hide";
+fs.mkdirSync(require("path").dirname(path), { recursive: true });
+fs.writeFileSync(path, JSON.stringify(state, null, 2) + "\n");
+'; then
+        touch "$sidebar_marker"
+    else
+        echo "Warning: could not set the default OpenCode sidebar state" >&2
+    fi
+fi
+
+# Install the Vim plugin into persistent config and cache.
+if ! grep -Rqs --include='tui.json' --include='tui.jsonc' \
+    -- "$VIM_PLUGIN" "$opencode_data/.config/opencode"; then
+    echo "Installing OpenCode Vim plugin..."
+    if ! docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        --cap-drop=ALL \
+        --security-opt=no-new-privileges \
+        -e HOME=/home/node \
+        -v "$HOST_PWD:$HOST_PWD" \
+        -v "$opencode_data/.opencode:/home/node/.opencode" \
+        -v "$HOME/.local/share/opencode:/home/node/.local/share/opencode" \
+        -v "$opencode_data/.local/state:/home/node/.local/state" \
+        -v "$opencode_data/.config/opencode:/home/node/.config/opencode" \
+        -v "$opencode_data/.cache:/home/node/.cache" \
+        -w "$HOST_PWD" \
+        "$IMAGE_NAME" opencode plugin "$VIM_PLUGIN" --global; then
+        echo "ERROR: failed to install OpenCode Vim plugin" >&2
+        exit 1
+    fi
+fi
+
+# Detect matching Compose containers and networks. The jail joins their
+# networks while its Docker shim limits CLI access to the same project.
 
 detect_compose_containers() {
     docker ps -a \
@@ -407,10 +427,7 @@ if [ ${#COMPOSE_CONTAINERS[@]} -gt 0 ]; then
     echo "Compose containers in scope: ${COMPOSE_CONTAINERS[*]}"
 fi
 
-# Cleanup: with `docker create --rm` the container auto-removes when
-# `docker start -a` returns, so the trap is only needed to catch the cases
-# where the script fails between `create` and `start`, or is killed by a
-# signal before the container ever runs.
+# Remove containers left behind before `docker start`.
 JAIL_CID=""
 cleanup_jail() {
     if [ -n "$JAIL_CID" ]; then
@@ -424,7 +441,7 @@ if [ -t 0 ] && [ -t 1 ]; then
     TTY_FLAGS+=(-t)
 fi
 
-# Find the host docker socket and its group so the in-container user can use it.
+# Find the host socket and grant its group.
 HOST_DOCKER_SOCK=""
 for candidate in /var/run/docker.sock /run/docker.sock; do
     if [ -S "$candidate" ]; then
@@ -469,19 +486,17 @@ if [ -n "$DOCKER_SOCK_GID" ]; then
     DOCKER_ARGS+=(--group-add "$DOCKER_SOCK_GID")
 fi
 
-# Attach the first network at create time; remaining networks are attached
-# via `docker network connect` between create and start.
+# Attach the first network during creation.
 if [ ${#ALL_NETWORKS[@]} -gt 0 ]; then
     DOCKER_ARGS+=(--network "${ALL_NETWORKS[0]}")
 fi
 
-# Append user-supplied environment variables
+# Add user environment variables.
 for env_var in "${ENV_VARS[@]}"; do
     DOCKER_ARGS+=(-e "$env_var")
 done
 
-# --shell mode: if a jail container is already running for this hostdir,
-# `docker exec` into it.
+# Reuse a running jail for shell mode.
 if [ "$SHELL_MODE" = true ]; then
     EXISTING=$(docker ps -q --filter "label=hostdir=$HOST_PWD" --filter "ancestor=$IMAGE_NAME" | head -1)
     if [ -n "$EXISTING" ]; then
@@ -490,8 +505,7 @@ if [ "$SHELL_MODE" = true ]; then
     fi
 fi
 
-# Create the container (not yet running) so we can attach extra networks
-# before start.
+# Create first so extra networks can be attached.
 set +e
 if [ "$SHELL_MODE" = true ]; then
     JAIL_CID=$(docker create "${DOCKER_ARGS[@]}" "$IMAGE_NAME" bash)
@@ -508,7 +522,7 @@ if [ "$CREATE_RC" -ne 0 ] || [ -z "$JAIL_CID" ]; then
     exit "${CREATE_RC:-1}"
 fi
 
-# Connect the remaining networks (index 0 was already attached at create).
+# Connect remaining networks.
 for ((i=1; i<${#ALL_NETWORKS[@]}; i++)); do
     if ! docker network connect "${ALL_NETWORKS[$i]}" "$JAIL_CID" >/dev/null 2>&1; then
         echo "Warning: failed to attach to network '${ALL_NETWORKS[$i]}'" >&2

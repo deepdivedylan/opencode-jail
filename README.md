@@ -58,7 +58,7 @@ Arguments after -- are passed through to opencode.
 ### Examples
 
 ```bash
-# Run opencode interactively (builds image on first run)
+# Run the full-screen OpenCode TUI
 opencode-jail
 
 # Open a shell inside the jail container
@@ -81,6 +81,27 @@ opencode-jail -- --help
 ```
 
 If `--shell` is used while a jail container from the same working directory is already running, the script `docker exec`s into it instead of starting a new one.
+
+### Vim prompt mode
+
+The Vim prompt plugin applies to the default full-screen interface. On first
+launch, the jail automatically installs
+[`@leohenon/opencode-vim-plugin`](https://github.com/leohenon/opencode-vim-plugin)
+and adds it to the persistent global OpenCode TUI configuration. Vim mode is
+enabled by default: press `Esc` for normal mode and `i` to return to insert
+mode. Use `/vim` or **Toggle vim mode** in the command palette to toggle it.
+
+The plugin requires OpenCode 1.17.10 or newer. The image installs the latest
+OpenCode release whenever it is built.
+
+This is separate from `/editor`, which opens the external `vim` executable
+using the mounted host `~/.vimrc` and `~/.vim/` configuration.
+
+### Sidebar
+
+The right sidebar is hidden by default. The launcher seeds this preference
+once in OpenCode's persistent UI state; afterward you can show or hide it with
+`Ctrl+x`, then `b`, and OpenCode will preserve your choice across launches.
 
 ## Configuration
 
