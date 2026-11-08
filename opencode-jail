@@ -123,7 +123,7 @@ fi
 if [ "$NEEDS_BUILD" = true ]; then
     BUILD_DIR=$(mktemp -d)
     cat > "$BUILD_DIR/Dockerfile" <<'DOCKERFILE'
-FROM node:22-bookworm
+FROM node:26-trixie
 
 ARG CUSTOM_APT_PACKAGES
 
