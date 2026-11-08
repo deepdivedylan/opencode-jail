@@ -2,7 +2,7 @@
 set -eo pipefail
 
 IMAGE_NAME="opencode-jail"
-VIM_PLUGIN="@leohenon/opencode-vim-plugin"
+VIM_PLUGIN="@leohenon/opencode-vim-plugin@beta"
 HOST_PWD="$(pwd)"
 SCRIPT_PATH="$(readlink -f "$0")"
 FORCE_REBUILD=false
@@ -160,7 +160,7 @@ RUN install -d /usr/local/libexec \
 COPY docker-shim /usr/local/bin/docker
 RUN chmod 0755 /usr/local/bin/docker
 
-RUN npm install -g opencode-ai
+RUN npm install -g @opencode/cli
 
 WORKDIR /workspace
 CMD ["opencode"]
@@ -373,7 +373,7 @@ if ! grep -Rqs --include='tui.json' --include='tui.jsonc' \
         -v "$opencode_data/.config/opencode:/home/node/.config/opencode" \
         -v "$opencode_data/.cache:/home/node/.cache" \
         -w "$HOST_PWD" \
-        "$IMAGE_NAME" opencode plugin "$VIM_PLUGIN" --global; then
+        "$IMAGE_NAME" opencode plugin add "$VIM_PLUGIN"; then
         echo "ERROR: failed to install OpenCode Vim plugin" >&2
         exit 1
     fi
